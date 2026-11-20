@@ -1,0 +1,6 @@
+{
+  "name": "Ustoz AI",
+  "description": "O'quvchilar uchun har qanday mavzuda mayda detallargacha qadamma-qadam o'rgatadigan va har bir qarorning sababini tushuntiradigan aqlli ta'lim tizimi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
