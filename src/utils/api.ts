@@ -43,7 +43,7 @@ export async function postJson<T>(
         }
         if (response.status === 404) {
           throw new Error(
-            "API server topilmadi (HTTP 404). Agar tashqi serverga qo'ygan bo'lsangiz, faqat static fayllarni emas, 'npm run build && npm start' (node server.ts) ni ishga tushiring; AI Studio'da esa ilovani qayta Share qilib ko'ring.",
+            `API server topilmadi (HTTP 404: ${url}). Serverda faqat static dist/ yuklangan bo'lishi mumkin: Node serverda 'npm run build && npm start', Vercel'da esa qayta deploy qilib GEMINI_API_KEY ni qo'shing.`,
           );
         }
         throw new Error(
@@ -71,7 +71,7 @@ export async function postJson<T>(
           parsed && typeof parsed.error === 'string'
             ? parsed.error
             : response.status === 404
-            ? "API server topilmadi (HTTP 404). Agar tashqi serverga qo'ygan bo'lsangiz, 'npm run build && npm start' (node server.ts) ni ishga tushiring; AI Studio'da esa ilovani qayta Share qiling."
+            ? `API server topilmadi (HTTP 404: ${url}). Node serverda 'npm run build && npm start' ni ishga tushiring.`
             : `So'rov xatolik bilan yakunlandi (HTTP ${response.status}).`;
         throw new Error(errorMsg);
       }

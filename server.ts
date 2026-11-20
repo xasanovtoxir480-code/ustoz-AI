@@ -28,7 +28,8 @@ function resolveServerPort(): number {
 }
 
 const PORT = resolveServerPort();
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction =
+  process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
 
 interface OmniKeyState {
   cooldownUntil: number;
@@ -661,12 +662,16 @@ function getLevelInstruction(level: string): string {
   return "O'quvchi darajasi: O'RTA. Oddiy tushunarli til, aniq qadamlar va real amaliy misollar bilan tushuntir.";
 }
 
-async function startServer() {
+export async function createApp(options: { skipFrontend?: boolean } = {}) {
   const app = express();
   app.use(express.json({ limit: '35mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, omniroute: getOmniRouteStats() });
+    res.json({
+      ok: true,
+      runtime: process.env.VERCEL ? 'vercel' : 'node',
+      omniroute: getOmniRouteStats(),
+    });
   });
 
   app.post('/api/ustoz/teach', async (req: Request, res: Response) => {
@@ -1159,29 +1164,42 @@ ${digest}`;
     });
   });
 
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
+  if (!options.skipFrontend) {
     const distDir = path.resolve(__dirname, 'dist');
-    if (fs.existsSync(distDir)) {
+    const hasDistBuild = fs.existsSync(path.join(distDir, 'index.html'));
+
+    if (isProduction && hasDistBuild) {
       app.use(express.static(distDir));
       app.get('*', (_req: Request, res: Response) => {
         res.sendFile(path.join(distDir, 'index.html'));
       });
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
     }
   }
 
+  return app;
+}
+
+async function startServer() {
+  const app = await createApp();
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Ustoz AI server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (
+  !process.env.VERCEL &&
+  !process.env.AWS_LAMBDA_FUNCTION_NAME &&
+  !process.env.NETLIFY
+) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
