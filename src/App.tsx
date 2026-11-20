@@ -108,6 +108,19 @@ export default function App() {
   };
 
   const handleSelectStarter = (topic: StarterTopic) => {
+    const existing = lessons.find(
+      (l) =>
+        l.question.trim().toLowerCase() === topic.question.trim().toLowerCase() &&
+        l.level === topic.level,
+    );
+    if (existing) {
+      setActiveLesson(existing);
+      setViewMode('sandbox');
+      setActiveNav('sandbox');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
     requestLesson({
       question: topic.question,
       level: topic.level,

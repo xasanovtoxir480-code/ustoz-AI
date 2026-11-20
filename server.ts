@@ -78,16 +78,17 @@ function getClientForKey(apiKey: string): GoogleGenAI {
   return client;
 }
 
-function getKeyState(apiKey: string): OmniKeyState {
-  let state = omniKeyHealth.get(apiKey);
+function getSlotState(apiKey: string, model: string): OmniKeyState {
+  const slotKey = `${apiKey}::${model}`;
+  let state = omniKeyHealth.get(slotKey);
   if (!state) {
     state = { cooldownUntil: 0, invalidUntil: 0, failCount: 0 };
-    omniKeyHealth.set(apiKey, state);
+    omniKeyHealth.set(slotKey, state);
   }
   return state;
 }
 
-function getOrderedOmniKeys(): string[] {
+function getOrderedOmniKeys(model: string): string[] {
   const allKeys = getConfiguredApiKeys();
   if (allKeys.length <= 1) return allKeys;
 
@@ -101,30 +102,30 @@ function getOrderedOmniKeys(): string[] {
   }
 
   const healthy = rotated.filter((k) => {
-    const s = getKeyState(k);
+    const s = getSlotState(k, model);
     return s.invalidUntil <= now && s.cooldownUntil <= now;
   });
 
   const coolingDown = rotated
     .filter((k) => {
-      const s = getKeyState(k);
+      const s = getSlotState(k, model);
       return s.invalidUntil <= now && s.cooldownUntil > now;
     })
-    .sort((a, b) => getKeyState(a).cooldownUntil - getKeyState(b).cooldownUntil);
+    .sort((a, b) => getSlotState(a, model).cooldownUntil - getSlotState(b, model).cooldownUntil);
 
-  // If healthy keys exist, try them first; otherwise retry the soonest-recovering cooling key
   return healthy.length > 0 ? [...healthy, ...coolingDown] : coolingDown.length > 0 ? coolingDown : rotated;
 }
 
 function getOmniRouteStats() {
   const keys = getConfiguredApiKeys();
   const now = Date.now();
+  const primaryModel = 'gemini-3.1-flash-lite';
   let healthyKeys = 0;
   let cooldownKeys = 0;
   let invalidKeys = 0;
 
   for (const key of keys) {
-    const state = getKeyState(key);
+    const state = getSlotState(key, primaryModel);
     if (state.invalidUntil > now) {
       invalidKeys++;
     } else if (state.cooldownUntil > now) {
@@ -149,6 +150,20 @@ function isQuotaError(msg: string): boolean {
     msg.includes('QUOTA') ||
     msg.includes('RATE_LIMIT')
   );
+}
+
+function getQuotaCooldownMs(msg: string): number {
+  if (msg.includes('PerDay') || msg.includes('per day')) {
+    return 15 * 60 * 1000;
+  }
+  const match = msg.match(/"retryDelay"\s*:\s*"(\d+)s"/);
+  if (match) {
+    const seconds = Number(match[1]);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.min(seconds * 1000, 15 * 60 * 1000);
+    }
+  }
+  return 65 * 1000;
 }
 
 function isAuthError(msg: string): boolean {
@@ -180,8 +195,8 @@ async function generateWithOmniRoute(
     timeoutMs?: number;
   },
 ) {
-  const orderedKeys = getOrderedOmniKeys();
-  if (orderedKeys.length === 0) {
+  const allKeys = getConfiguredApiKeys();
+  if (allKeys.length === 0) {
     throw new Error('NO_API_KEYS');
   }
 
@@ -192,15 +207,17 @@ async function generateWithOmniRoute(
     { model: 'gemini-4-hydrogen', useThinking: true, limitMs: Math.min(timeoutMs, 10000) },
   ];
 
+  let primaryError: unknown;
   let lastError: unknown;
 
   for (let passIdx = 0; passIdx < modelsToTry.length; passIdx++) {
     const candidate = modelsToTry[passIdx];
+    const orderedKeys = getOrderedOmniKeys(candidate.model);
     const now = Date.now();
     const eligibleKeys = orderedKeys.filter((k) => {
-      const s = getKeyState(k);
+      const s = getSlotState(k, candidate.model);
       if (s.invalidUntil > now) return false;
-      // On retry passes, skip keys already placed in cooldown during earlier passes
+      // On fallback passes, skip keys/models already known to be in cooldown
       if (passIdx > 0 && s.cooldownUntil > now) return false;
       return true;
     });
@@ -215,7 +232,7 @@ async function generateWithOmniRoute(
 
     for (let kIdx = 0; kIdx < eligibleKeys.length; kIdx++) {
       const apiKey = eligibleKeys[kIdx];
-      const state = getKeyState(apiKey);
+      const state = getSlotState(apiKey, candidate.model);
       const ai = getClientForKey(apiKey);
 
       try {
@@ -240,9 +257,13 @@ async function generateWithOmniRoute(
         state.failCount = 0;
         return result;
       } catch (error) {
+        if (passIdx === 0 && !primaryError) {
+          primaryError = error;
+        }
         lastError = error;
         const msg = error instanceof Error ? error.message : String(error);
-        console.error(`[OmniRoute] Pass#${passIdx + 1} Key#${kIdx + 1} (${candidate.model}) xatosi:`, msg);
+        const shortMsg = msg.slice(0, 160).replace(/\s+/g, ' ');
+        console.warn(`[OmniRoute] Pass#${passIdx + 1} Key#${kIdx + 1} (${candidate.model}): ${shortMsg}`);
 
         if (isAuthError(msg)) {
           state.invalidUntil = Date.now() + 10 * 60 * 1000;
@@ -251,7 +272,7 @@ async function generateWithOmniRoute(
         }
 
         if (isQuotaError(msg)) {
-          state.cooldownUntil = Date.now() + 65 * 1000;
+          state.cooldownUntil = Date.now() + getQuotaCooldownMs(msg);
           state.failCount++;
           continue;
         }
@@ -261,7 +282,7 @@ async function generateWithOmniRoute(
     }
   }
 
-  throw lastError || new Error('OMNIROUTE_EXHAUSTED');
+  throw primaryError || lastError || new Error('OMNIROUTE_EXHAUSTED');
 }
 
 function mapGeminiError(error: unknown): { status: number; message: string } {
