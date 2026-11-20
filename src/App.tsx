@@ -66,6 +66,7 @@ export default function App() {
     imageMimeType?: string;
     fileBase64?: string;
     fileMimeType?: string;
+    pdfExtractedText?: string;
     remediationContext?: {
       previousLessonTitle: string;
       misunderstoodTopics: MisunderstoodItem[];

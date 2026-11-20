@@ -12,12 +12,61 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
-function createGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    return null;
+interface OmniKeyState {
+  cooldownUntil: number;
+  invalidUntil: number;
+  failCount: number;
+}
+
+const omniClientCache = new Map<string, GoogleGenAI>();
+const omniKeyHealth = new Map<string, OmniKeyState>();
+let omniRoundRobinCursor = 0;
+
+function getConfiguredApiKeys(): string[] {
+  const rawSources: Array<string | undefined> = [
+    process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEYS,
+    process.env.OMNIROUTE_API_KEYS,
+    process.env.GEMINI_FALLBACK_API_KEY,
+  ];
+
+  for (let i = 1; i <= 10; i++) {
+    rawSources.push(process.env[`GEMINI_API_KEY_${i}`]);
   }
-  return new GoogleGenAI({
+
+  const seen = new Set<string>();
+  const keys: string[] = [];
+
+  for (const raw of rawSources) {
+    if (!raw) continue;
+    const parts = raw
+      .split(/[\s,;]+/)
+      .map((item) => item.trim().replace(/^['"]|['"]$/g, ''))
+      .filter(Boolean);
+
+    for (const key of parts) {
+      if (
+        key === 'MY_GEMINI_API_KEY' ||
+        key === 'MY_BACKUP_GEMINI_API_KEY' ||
+        key === 'KEY_1' ||
+        key === 'KEY_2'
+      ) {
+        continue;
+      }
+      if (!seen.has(key)) {
+        seen.add(key);
+        keys.push(key);
+      }
+    }
+  }
+
+  return keys;
+}
+
+function getClientForKey(apiKey: string): GoogleGenAI {
+  const cached = omniClientCache.get(apiKey);
+  if (cached) return cached;
+  const client = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
@@ -25,16 +74,90 @@ function createGeminiClient(): GoogleGenAI | null {
       },
     },
   });
+  omniClientCache.set(apiKey, client);
+  return client;
 }
 
-function isTransientError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+function getKeyState(apiKey: string): OmniKeyState {
+  let state = omniKeyHealth.get(apiKey);
+  if (!state) {
+    state = { cooldownUntil: 0, invalidUntil: 0, failCount: 0 };
+    omniKeyHealth.set(apiKey, state);
+  }
+  return state;
+}
+
+function getOrderedOmniKeys(): string[] {
+  const allKeys = getConfiguredApiKeys();
+  if (allKeys.length <= 1) return allKeys;
+
+  const now = Date.now();
+  const rotated: string[] = [];
+  const startIdx = omniRoundRobinCursor % allKeys.length;
+  omniRoundRobinCursor = (omniRoundRobinCursor + 1) % allKeys.length;
+
+  for (let offset = 0; offset < allKeys.length; offset++) {
+    rotated.push(allKeys[(startIdx + offset) % allKeys.length]);
+  }
+
+  const healthy = rotated.filter((k) => {
+    const s = getKeyState(k);
+    return s.invalidUntil <= now && s.cooldownUntil <= now;
+  });
+
+  const coolingDown = rotated
+    .filter((k) => {
+      const s = getKeyState(k);
+      return s.invalidUntil <= now && s.cooldownUntil > now;
+    })
+    .sort((a, b) => getKeyState(a).cooldownUntil - getKeyState(b).cooldownUntil);
+
+  // If healthy keys exist, try them first; otherwise retry the soonest-recovering cooling key
+  return healthy.length > 0 ? [...healthy, ...coolingDown] : coolingDown.length > 0 ? coolingDown : rotated;
+}
+
+function getOmniRouteStats() {
+  const keys = getConfiguredApiKeys();
+  const now = Date.now();
+  let healthyKeys = 0;
+  let cooldownKeys = 0;
+  let invalidKeys = 0;
+
+  for (const key of keys) {
+    const state = getKeyState(key);
+    if (state.invalidUntil > now) {
+      invalidKeys++;
+    } else if (state.cooldownUntil > now) {
+      cooldownKeys++;
+    } else {
+      healthyKeys++;
+    }
+  }
+
+  return {
+    totalKeys: keys.length,
+    healthyKeys,
+    cooldownKeys,
+    invalidKeys,
+  };
+}
+
+function isQuotaError(msg: string): boolean {
   return (
-    message.includes('503') ||
-    message.includes('500') ||
-    message.includes('UNAVAILABLE') ||
-    message.includes('ECONNRESET') ||
-    message.includes('ETIMEDOUT')
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('429') ||
+    msg.includes('QUOTA') ||
+    msg.includes('RATE_LIMIT')
+  );
+}
+
+function isAuthError(msg: string): boolean {
+  return (
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT') ||
+    msg.includes('401') ||
+    msg.includes('403')
   );
 }
 
@@ -48,62 +171,97 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
-async function generateWithResilience(
-  ai: GoogleGenAI,
+async function generateWithOmniRoute(
   params: {
     contents: unknown;
     systemInstruction: string;
-    preferFastModel?: boolean;
     thinkingLevel: ThinkingLevel;
     responseSchema: Record<string, unknown>;
     timeoutMs?: number;
   },
 ) {
-  const { preferFastModel = true, timeoutMs = 20000 } = params;
+  const orderedKeys = getOrderedOmniKeys();
+  if (orderedKeys.length === 0) {
+    throw new Error('NO_API_KEYS');
+  }
 
-  const modelsToTry: Array<{ model: string; useThinking: boolean; limitMs: number }> = preferFastModel
-    ? [
-        { model: 'gemini-3.1-flash-lite', useThinking: false, limitMs: timeoutMs },
-        { model: 'gemini-4-hydrogen', useThinking: true, limitMs: Math.min(timeoutMs + 4000, 22000) },
-      ]
-    : [
-        { model: 'gemini-4-hydrogen', useThinking: true, limitMs: Math.min(timeoutMs, 20000) },
-        { model: 'gemini-3.1-flash-lite', useThinking: false, limitMs: Math.min(timeoutMs, 18000) },
-      ];
+  const { timeoutMs = 20000 } = params;
+  const modelsToTry: Array<{ model: string; useThinking: boolean; limitMs: number; pauseBeforeMs?: number }> = [
+    { model: 'gemini-3.1-flash-lite', useThinking: false, limitMs: timeoutMs },
+    { model: 'gemini-3.1-flash-lite', useThinking: false, limitMs: timeoutMs, pauseBeforeMs: 450 },
+    { model: 'gemini-4-hydrogen', useThinking: true, limitMs: Math.min(timeoutMs, 10000) },
+  ];
 
   let lastError: unknown;
-  for (let idx = 0; idx < modelsToTry.length; idx++) {
-    const candidate = modelsToTry[idx];
-    try {
-      return await withTimeout(
-        ai.models.generateContent({
-          model: candidate.model,
-          contents: params.contents as Parameters<typeof ai.models.generateContent>[0]['contents'],
-          config: {
-            systemInstruction: params.systemInstruction,
-            ...(candidate.useThinking
-              ? { thinkingConfig: { thinkingLevel: params.thinkingLevel } }
-              : {}),
-            responseMimeType: 'application/json',
-            responseSchema: params.responseSchema,
-          },
-        }),
-        candidate.limitMs,
-        candidate.model,
-      );
-    } catch (error) {
-      lastError = error;
-      const msg = error instanceof Error ? error.message : String(error);
-      console.error(`[Ustoz AI] ${candidate.model} xatosi:`, msg);
-      const isAuthError =
-        msg.includes('API_KEY_INVALID') || msg.includes('PERMISSION_DENIED');
-      if (isAuthError || idx === modelsToTry.length - 1) {
-        throw error;
+
+  for (let passIdx = 0; passIdx < modelsToTry.length; passIdx++) {
+    const candidate = modelsToTry[passIdx];
+    const now = Date.now();
+    const eligibleKeys = orderedKeys.filter((k) => {
+      const s = getKeyState(k);
+      if (s.invalidUntil > now) return false;
+      // On retry passes, skip keys already placed in cooldown during earlier passes
+      if (passIdx > 0 && s.cooldownUntil > now) return false;
+      return true;
+    });
+
+    if (eligibleKeys.length === 0) {
+      continue;
+    }
+
+    if (candidate.pauseBeforeMs) {
+      await new Promise((resolve) => setTimeout(resolve, candidate.pauseBeforeMs));
+    }
+
+    for (let kIdx = 0; kIdx < eligibleKeys.length; kIdx++) {
+      const apiKey = eligibleKeys[kIdx];
+      const state = getKeyState(apiKey);
+      const ai = getClientForKey(apiKey);
+
+      try {
+        const result = await withTimeout(
+          ai.models.generateContent({
+            model: candidate.model,
+            contents: params.contents as Parameters<typeof ai.models.generateContent>[0]['contents'],
+            config: {
+              systemInstruction: params.systemInstruction,
+              ...(candidate.useThinking
+                ? { thinkingConfig: { thinkingLevel: params.thinkingLevel } }
+                : {}),
+              responseMimeType: 'application/json',
+              responseSchema: params.responseSchema,
+            },
+          }),
+          candidate.limitMs,
+          candidate.model,
+        );
+
+        state.cooldownUntil = 0;
+        state.failCount = 0;
+        return result;
+      } catch (error) {
+        lastError = error;
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error(`[OmniRoute] Pass#${passIdx + 1} Key#${kIdx + 1} (${candidate.model}) xatosi:`, msg);
+
+        if (isAuthError(msg)) {
+          state.invalidUntil = Date.now() + 10 * 60 * 1000;
+          state.failCount++;
+          continue;
+        }
+
+        if (isQuotaError(msg)) {
+          state.cooldownUntil = Date.now() + 65 * 1000;
+          state.failCount++;
+          continue;
+        }
+
+        state.failCount++;
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }
-  throw lastError;
+
+  throw lastError || new Error('OMNIROUTE_EXHAUSTED');
 }
 
 function mapGeminiError(error: unknown): { status: number; message: string } {
@@ -469,12 +627,11 @@ async function startServer() {
   app.use(express.json({ limit: '35mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true });
+    res.json({ ok: true, omniroute: getOmniRouteStats() });
   });
 
   app.post('/api/ustoz/teach', async (req: Request, res: Response) => {
-    const ai = createGeminiClient();
-    if (!ai) {
+    if (getConfiguredApiKeys().length === 0) {
       res.status(500).json({
         error:
           "GEMINI_API_KEY sozlanmagan. Settings > Secrets bo'limiga API kalitni kiriting.",
@@ -490,6 +647,7 @@ async function startServer() {
       imageMimeType,
       fileBase64,
       fileMimeType,
+      pdfExtractedText,
       remediationContext,
       pdfFocusContext,
     } = req.body ?? {};
@@ -501,7 +659,6 @@ async function startServer() {
 
     const levelGuide = getLevelInstruction(String(level));
     const thinkingLevel = ThinkingLevel.LOW;
-    const preferFastModel = level !== 'deep';
 
     const remediationNote =
       remediationContext && typeof remediationContext === 'object'
@@ -514,9 +671,10 @@ Vazifangiz: Aynan shu joylarni avvalgidan ANCHA SODDAROQ qilib, yangi oddiy hayo
     const pdfFocusNote =
       pdfFocusContext && typeof pdfFocusContext === 'object'
         ? `\nDIQQAT — YUKLANGAN PDF BO'YICHA TUSHUNTIRISH:
-O'quvchi dars PDF faylini qayta yukladi va quyidagi bo'limlar/joylarni tushunmaganini ko'rsatdi:
+O'quvchi "${String(pdfFocusContext.documentTitle || 'dars.pdf')}" faylini qayta yukladi va quyidagi bo'limlar/joylarni tushunmaganini ko'rsatdi:
 Tanlangan bo'limlar: ${JSON.stringify(pdfFocusContext.selectedSections || [])}
-Vazifangiz: Biriktirilgan PDF fayl mazmuniga tayanib, o'quvchi tushunmagan aynan shu joylarni avvalgidan ancha sodda, mayda qadamlar va "Nima uchun shunday?" mantiqi bilan qaytadan tushuntirib bering.`
+${pdfExtractedText ? `\nPDF MATNI:\n${String(pdfExtractedText).slice(0, 14000)}\n` : ''}
+Vazifangiz: Shu PDF mazmuniga tayanib, o'quvchi tushunmagan aynan shu joylarni avvalgidan ancha sodda, mayda qadamlar va "Nima uchun shunday?" mantiqi bilan qaytadan tushuntirib bering.`
         : '';
 
     const systemInstruction = `Sen "Ustoz AI" — o'quvchining yonida o'tirgan mehribon, sabrli va hamma narsani juda sodda tushuntiradigan ustozsan.
@@ -552,13 +710,12 @@ Shu mavzuni juda tushunarli, mayda qadamlar bilan va har bir qadamning nega shun
             }
           : promptText;
 
-      const response = await generateWithResilience(ai, {
+      const response = await generateWithOmniRoute({
         contents,
         systemInstruction,
-        preferFastModel,
         thinkingLevel,
         responseSchema: lessonResponseSchema,
-        timeoutMs: attachmentBase64 ? 26000 : 20000,
+        timeoutMs: attachmentBase64 ? 24000 : 18000,
       });
 
       const rawText = (response.text ?? '').trim();
@@ -584,8 +741,7 @@ Shu mavzuni juda tushunarli, mayda qadamlar bilan va har bir qadamning nega shun
   });
 
   app.post('/api/ustoz/pdf/outline', async (req: Request, res: Response) => {
-    const ai = createGeminiClient();
-    if (!ai) {
+    if (getConfiguredApiKeys().length === 0) {
       res.status(500).json({
         error:
           "GEMINI_API_KEY sozlanmagan. Settings > Secrets bo'limiga API kalitni kiriting.",
@@ -600,7 +756,7 @@ Shu mavzuni juda tushunarli, mayda qadamlar bilan va har bir qadamning nega shun
     }
 
     try {
-      const response = await generateWithResilience(ai, {
+      const response = await generateWithOmniRoute({
         contents: {
           parts: [
             {
@@ -616,10 +772,9 @@ Shu mavzuni juda tushunarli, mayda qadamlar bilan va har bir qadamning nega shun
         },
         systemInstruction:
           "Sen Ustoz AI san. Yuklangan PDF hujjatdagi mavzu va bo'limlarni qisqa, sodda va tushunarli qilib ajratib ber.",
-        preferFastModel: true,
         thinkingLevel: ThinkingLevel.LOW,
         responseSchema: pdfOutlineSchema,
-        timeoutMs: 22000,
+        timeoutMs: 20000,
       });
 
       const rawText = (response.text ?? '').trim();
@@ -637,8 +792,7 @@ Shu mavzuni juda tushunarli, mayda qadamlar bilan va har bir qadamning nega shun
   });
 
   app.post('/api/ustoz/followup', async (req: Request, res: Response) => {
-    const ai = createGeminiClient();
-    if (!ai) {
+    if (getConfiguredApiKeys().length === 0) {
       res.status(500).json({
         error:
           "GEMINI_API_KEY sozlanmagan. Settings > Secrets bo'limiga API kalitni kiriting.",
@@ -680,10 +834,9 @@ ${recentHistory ? `Oldingi suhbat:\n${recentHistory}\n` : ''}
 O'quvchining savoli: "${followUpQuestion.trim()}"`;
 
     try {
-      const response = await generateWithResilience(ai, {
+      const response = await generateWithOmniRoute({
         contents: prompt,
         systemInstruction,
-        preferFastModel: true,
         thinkingLevel: ThinkingLevel.LOW,
         responseSchema: followUpSchema,
         timeoutMs: 15000,
@@ -704,8 +857,7 @@ O'quvchining savoli: "${followUpQuestion.trim()}"`;
   });
 
   app.post('/api/ustoz/exam/generate', async (req: Request, res: Response) => {
-    const ai = createGeminiClient();
-    if (!ai) {
+    if (getConfiguredApiKeys().length === 0) {
       res.status(500).json({
         error:
           "GEMINI_API_KEY sozlanmagan. Settings > Secrets bo'limiga API kalitni kiriting.",
@@ -745,13 +897,12 @@ ${stepsDigest}
 Shu dars bo'yicha o'quvchi tushungan yoki tushunmaganini aniq bilib oladigan 5 ta sodda, tushunarli test savoli tuz.`;
 
     try {
-      const response = await generateWithResilience(ai, {
+      const response = await generateWithOmniRoute({
         contents: prompt,
         systemInstruction,
-        preferFastModel: true,
         thinkingLevel: ThinkingLevel.LOW,
         responseSchema: examGenerateSchema,
-        timeoutMs: 22000,
+        timeoutMs: 20000,
       });
 
       const rawText = (response.text ?? '').trim();
@@ -782,8 +933,7 @@ Shu dars bo'yicha o'quvchi tushungan yoki tushunmaganini aniq bilib oladigan 5 t
   });
 
   app.post('/api/ustoz/exam/evaluate', async (req: Request, res: Response) => {
-    const ai = createGeminiClient();
-    if (!ai) {
+    if (getConfiguredApiKeys().length === 0) {
       res.status(500).json({
         error:
           "GEMINI_API_KEY sozlanmagan. Settings > Secrets bo'limiga API kalitni kiriting.",
@@ -874,10 +1024,9 @@ Natijalar:
 ${digest}`;
 
     try {
-      const response = await generateWithResilience(ai, {
+      const response = await generateWithOmniRoute({
         contents: prompt,
         systemInstruction,
-        preferFastModel: true,
         thinkingLevel: ThinkingLevel.LOW,
         responseSchema: examEvaluateSchema,
         timeoutMs: 12000,

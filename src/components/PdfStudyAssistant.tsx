@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { exportLessonToPdf } from '../utils/exportLessonPdf';
 import { postJson } from '../utils/api';
+import { extractPdfLocally } from '../utils/parsePdfClient';
 import { PdfCanvasViewer } from './PdfCanvasViewer';
 import type {
   LessonData,
@@ -27,8 +28,9 @@ interface PdfStudyAssistantProps {
     question: string;
     level: TeachingLevel;
     subjectHint: string;
-    fileBase64: string;
-    fileMimeType: string;
+    fileBase64?: string;
+    fileMimeType?: string;
+    pdfExtractedText?: string;
     pdfFocusContext: {
       documentTitle: string;
       selectedSections: PdfOutlineSection[];
@@ -57,6 +59,7 @@ export function PdfStudyAssistant({
     sizeKb: number;
     base64: string;
     bytes: Uint8Array;
+    extractedText: string;
   } | null>(null);
 
   const [outline, setOutline] = useState<PdfOutlineData | null>(null);
@@ -109,6 +112,8 @@ export function PdfStudyAssistant({
     const arrayBuffer = await file.arrayBuffer();
     const bytes = new Uint8Array(arrayBuffer);
 
+    const localExtraction = await extractPdfLocally(bytes, file.name);
+
     const reader = new FileReader();
     reader.onload = () => {
       const result = typeof reader.result === 'string' ? reader.result : '';
@@ -120,8 +125,16 @@ export function PdfStudyAssistant({
         sizeKb: Math.max(1, Math.round(file.size / 1024)),
         base64,
         bytes,
+        extractedText: localExtraction.extractedText,
       });
-      inspectPdfOutline(base64, file.name);
+
+      if (localExtraction.outline) {
+        setScanError(null);
+        setSelectedSectionNums([]);
+        setOutline(localExtraction.outline);
+      } else {
+        inspectPdfOutline(base64, file.name);
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -148,12 +161,15 @@ export function PdfStudyAssistant({
       ? `Yuklangan PDF darsdagi mana bu bo'limlarni tushunmadim: ${sectionTitles}. Iltimos, shularni oddiy tilda mayda qadamlargacha qayta tushuntiring.`
       : `Yuklangan "${pdfFile.name}" PDF darsdagi asosiy joylarni juda oddiy tilda mayda qadamlargacha tushuntirib bering.`;
 
+    const hasExtractedText = pdfFile.extractedText.trim().length > 40;
+
     onAskFromPdf({
       question: questionText,
       level,
       subjectHint: outline?.subject || activeLesson?.subject || '',
-      fileBase64: pdfFile.base64,
-      fileMimeType: 'application/pdf',
+      ...(hasExtractedText
+        ? { pdfExtractedText: pdfFile.extractedText }
+        : { fileBase64: pdfFile.base64, fileMimeType: 'application/pdf' }),
       pdfFocusContext: {
         documentTitle: outline?.documentTitle || pdfFile.name,
         selectedSections: chosenSections,

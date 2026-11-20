@@ -13,7 +13,7 @@ export async function postJson<T>(
     timeoutMessage = "Javob kutish vaqti tugadi. Iltimos, qayta urinib ko'ring.",
   } = options;
 
-  const attemptFetch = async (retried: boolean): Promise<T> => {
+  const attemptFetch = async (retryCount: number): Promise<T> => {
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
 
@@ -32,13 +32,18 @@ export async function postJson<T>(
       const trimmed = rawText.trim();
 
       if (trimmed.startsWith('<')) {
-        if (!retried) {
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-          return attemptFetch(true);
+        if (retryCount < 2) {
+          await new Promise((resolve) => setTimeout(resolve, retryCount === 0 ? 1500 : 2500));
+          return attemptFetch(retryCount + 1);
         }
         if (response.status === 504 || response.status === 502 || response.status === 408) {
           throw new Error(
             "Server band yoki vaqtincha javob bermadi. Bir necha soniyadan so'ng qayta urinib ko'ring.",
+          );
+        }
+        if (response.status === 404) {
+          throw new Error(
+            "Server uyqudan uyg'onayotgan bo'lishi mumkin yoki eski ulashilgan havola ochilgan (HTTP 404). Sahifani yangilab (F5) qayta urinib ko'ring.",
           );
         }
         throw new Error(
@@ -58,9 +63,15 @@ export async function postJson<T>(
       }
 
       if (!response.ok) {
+        if (response.status === 404 && !trimmed && retryCount < 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          return attemptFetch(retryCount + 1);
+        }
         const errorMsg =
           parsed && typeof parsed.error === 'string'
             ? parsed.error
+            : response.status === 404
+            ? "Server manzili topilmadi (HTTP 404). Agar ulashilgan havola (Shared URL) dan kirayotgan bo'lsangiz, ilovani qayta ulashing (Share) yoki asosiy Dev oynadan oching."
             : `So'rov xatolik bilan yakunlandi (HTTP ${response.status}).`;
         throw new Error(errorMsg);
       }
@@ -80,5 +91,5 @@ export async function postJson<T>(
     }
   };
 
-  return attemptFetch(false);
+  return attemptFetch(0);
 }
